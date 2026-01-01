@@ -15,10 +15,10 @@ tokio = { version = "1", features = ["full"] }
 
 # Local patched Sui checkout (see UPSTREAM_ISSUE.md for details)
 # Update these paths to point to your local sui checkout with the bitwise typing fix
-move-binary-format = { path = "vendor/sui/external-crates/move/crates/move-binary-format" }
-move-model-2 = { path = "vendor/sui/external-crates/move/crates/move-model-2" }
-move-stackless-bytecode-2 = { path = "vendor/sui/external-crates/move/crates/move-stackless-bytecode-2" }
-move-core-types = { path = "vendor/sui/external-crates/move/crates/move-core-types" }
-sui-sdk = { path = "vendor/sui/crates/sui-sdk" }
+move-binary-format = { path = "../sui-package-benchmark/.local/research/vendor/sui/external-crates/move/crates/move-binary-format" }
+move-model-2 = { path = "../sui-package-benchmark/.local/research/vendor/sui/external-crates/move/crates/move-model-2" }
+move-stackless-bytecode-2 = { path = "../sui-package-benchmark/.local/research/vendor/sui/external-crates/move/crates/move-stackless-bytecode-2" }
+move-core-types = { path = "../sui-package-benchmark/.local/research/vendor/sui/external-crates/move/crates/move-core-types" }
+sui-sdk = { path = "../sui-package-benchmark/.local/research/vendor/sui/crates/sui-sdk" }
 
 
