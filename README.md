@@ -15,7 +15,11 @@ For each package, it verifies that functions, structs, type signatures, abilitie
 Tested against 1,000 most-used mainnet packages:
 
 ```
-rows 1000, ok 1000 (100.0%)
+total: 1000
+local_ok: 1000
+rpc_ok: 1000
+interface_ok: 1000
+problems: 0
 ```
 
 ## Usage
@@ -24,7 +28,12 @@ rows 1000, ok 1000 (100.0%)
 # Build
 cargo build --release
 
-# Verify inventory for packages listed in a JSONL file
+# Corpus output (detailed stats matching extractor1 schema)
+cargo run --release -- \
+  --verify-inventory-from-summary-jsonl /path/to/packages.jsonl \
+  --corpus-out-dir results/corpus_output
+
+# Legacy simple output
 cargo run --release -- \
   --verify-inventory-from-summary-jsonl /path/to/packages.jsonl \
   --verify-inventory-out-jsonl /tmp/results.jsonl
@@ -33,7 +42,7 @@ cargo run --release -- \
 cargo run --release -- \
   --verify-inventory-from-summary-jsonl /path/to/packages.jsonl \
   --verify-inventory-sample-size 100 \
-  --verify-inventory-out-jsonl /tmp/results.jsonl
+  --corpus-out-dir results/sample_100
 ```
 
 ### Input format
@@ -45,8 +54,79 @@ The input JSONL should have rows with `resolved_package_id` or `package_id` fiel
 {"resolved_package_id": "0x1234...abcd"}
 ```
 
-### Output format
+### Output formats
 
+#### Corpus output (`--corpus-out-dir`)
+
+Produces detailed results matching extractor1 schema:
+
+```
+corpus_output/
+├── corpus_report.jsonl   # Per-package detailed results
+├── corpus_summary.json   # Aggregate statistics  
+├── index.jsonl           # Package ID index
+└── problems.jsonl        # Packages with errors
+```
+
+**corpus_report.jsonl row:**
+```json
+{
+  "package_id": "0x...",
+  "package_dir": "/path/to/package",
+  "local": {
+    "modules": 61,
+    "structs": 119,
+    "functions_total": 786,
+    "functions_public": 584,
+    "functions_friend": 96,
+    "functions_private": 106,
+    "functions_native": 68,
+    "entry_functions": 27,
+    "key_structs": 36
+  },
+  "rpc": {
+    "modules": 61,
+    "structs": 119,
+    "functions": 683,
+    "key_structs": 36
+  },
+  "rpc_vs_local": {
+    "left_count": 61,
+    "right_count": 61,
+    "missing_in_right": [],
+    "extra_in_right": []
+  },
+  "interface_compare": {
+    "modules_compared": 61,
+    "structs_compared": 119,
+    "struct_mismatches": 0,
+    "functions_compared": 683,
+    "function_mismatches": 0,
+    "mismatches_total": 0
+  },
+  "error": null
+}
+```
+
+**corpus_summary.json:**
+```json
+{
+  "total": 1000,
+  "local_ok": 1000,
+  "rpc_enabled": true,
+  "rpc_ok": 1000,
+  "rpc_module_match": 1000,
+  "interface_compare_enabled": true,
+  "interface_ok": 1000,
+  "interface_mismatch_packages": 0,
+  "interface_mismatches_total": 0,
+  "problems": 0
+}
+```
+
+#### Legacy output (`--verify-inventory-out-jsonl`)
+
+Simple per-package JSONL:
 ```json
 {
   "resolved_package_id": "0x...",
@@ -71,43 +151,11 @@ export SUI_PACKAGES_DIR=/path/to/sui-packages
 
 Default: `../sui-packages` (relative to cwd)
 
-Expected dataset structure:
-```
-$SUI_PACKAGES_DIR/packages/mainnet_most_used/
-  0x00/
-    00000000000000000000000000000000000000000000000000000000000002/
-      bytecode_modules/*.mv
-      metadata.json
-      bcs.json
-```
-
 ### Local Sui vendor checkout
 
 This project depends on a local checkout of the Sui repo with a patch applied to fix a bug in `move-stackless-bytecode-2`. Update the paths in `Cargo.toml` to point to your patched checkout.
 
-**Required patch:** The `move-stackless-bytecode-2` crate has a bug where bitwise operations (`BitAnd`, `BitOr`, `Xor`) incorrectly return `Bool` type instead of the integer operand type, causing panics on common packages.
-
 See [UPSTREAM_ISSUE.md](./UPSTREAM_ISSUE.md) for the bug report and patch details.
-
-### Setting up the vendor checkout
-
-1. Clone the Sui repo:
-   ```bash
-   git clone https://github.com/MystenLabs/sui.git vendor/sui
-   cd vendor/sui
-   ```
-
-2. Apply the patch to `external-crates/move/crates/move-stackless-bytecode-2/src/translate.rs`:
-   ```diff
-   - IB::BitAnd => binop!(Op::BitAnd, lhs => N::Type::Bool.into()),
-   - IB::BitOr  => binop!(Op::BitOr,  lhs => N::Type::Bool.into()),
-   - IB::Xor    => binop!(Op::Xor,    lhs => N::Type::Bool.into()),
-   + IB::BitAnd => binop!(Op::BitAnd, lhs => lhs.ty.clone()),
-   + IB::BitOr  => binop!(Op::BitOr,  lhs => lhs.ty.clone()),
-   + IB::Xor    => binop!(Op::Xor,    lhs => lhs.ty.clone()),
-   ```
-
-3. Update `Cargo.toml` paths to point to your vendor checkout.
 
 ## License
 

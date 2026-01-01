@@ -1,0 +1,16 @@
+{
+  "total": 1000,
+  "local_ok": 1000,
+  "rpc_enabled": true,
+  "rpc_ok": 1000,
+  "rpc_module_match": 1000,
+  "rpc_exposed_function_count_match": 1000,
+  "interface_compare_enabled": true,
+  "interface_ok": 1000,
+  "interface_mismatch_packages": 0,
+  "interface_mismatches_total": 0,
+  "problems": 0,
+  "report_jsonl": "results/corpus_mainnet_1000/corpus_report.jsonl",
+  "index_jsonl": "results/corpus_mainnet_1000/index.jsonl",
+  "problems_jsonl": "results/corpus_mainnet_1000/problems.jsonl"
+}

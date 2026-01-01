@@ -83,6 +83,10 @@ struct Args {
     /// Sample size for inventory verification (defaults to all rows).
     #[arg(long, value_name = "N")]
     verify_inventory_sample_size: Option<usize>,
+
+    /// Output directory for corpus-format results (detailed stats matching extractor1 schema).
+    #[arg(long, value_name = "DIR")]
+    corpus_out_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -452,6 +456,73 @@ struct PackageInventory {
     modules: BTreeMap<String, ModuleInventory>,
 }
 
+/// Local bytecode statistics (from .mv files)
+#[derive(Debug, Clone, Serialize, Default)]
+struct LocalStats {
+    modules: usize,
+    structs: usize,
+    functions_total: usize,
+    functions_public: usize,
+    functions_friend: usize,
+    functions_private: usize,
+    functions_native: usize,
+    entry_functions: usize,
+    public_entry_functions: usize,
+    friend_entry_functions: usize,
+    private_entry_functions: usize,
+    key_structs: usize,
+}
+
+/// RPC normalized module statistics
+#[derive(Debug, Clone, Serialize, Default)]
+struct RpcStats {
+    modules: usize,
+    structs: usize,
+    functions: usize,
+    key_structs: usize,
+}
+
+/// Module count comparison result
+#[derive(Debug, Clone, Serialize, Default)]
+struct ModuleCountComparison {
+    left_count: usize,
+    right_count: usize,
+    missing_in_right: Vec<String>,
+    extra_in_right: Vec<String>,
+}
+
+/// Interface comparison result
+#[derive(Debug, Clone, Serialize, Default)]
+struct InterfaceCompare {
+    modules_compared: usize,
+    modules_missing_in_bytecode: usize,
+    modules_extra_in_bytecode: usize,
+    structs_compared: usize,
+    struct_mismatches: usize,
+    functions_compared: usize,
+    function_mismatches: usize,
+    mismatches_total: usize,
+}
+
+/// Full corpus report row matching extractor1 schema
+#[derive(Debug, Serialize)]
+struct CorpusReportRow {
+    package_id: String,
+    package_dir: String,
+
+    local: LocalStats,
+
+    rpc: RpcStats,
+
+    rpc_vs_local: ModuleCountComparison,
+
+    interface_compare: InterfaceCompare,
+    interface_compare_sample: Option<Vec<Value>>,
+
+    error: Option<String>,
+}
+
+/// Legacy simple output format (for backwards compatibility)
 #[derive(Debug, serde::Serialize)]
 struct InventoryVerifyRow {
     resolved_package_id: String,
@@ -649,6 +720,80 @@ fn package_inventory_from_compiled_modules(modules: &[CompiledModule]) -> Packag
         out.insert(name, module_inventory_from_compiled_module(m));
     }
     PackageInventory { modules: out }
+}
+
+/// Compute detailed statistics from compiled modules matching extractor1's `local` field
+fn compute_local_stats(modules: &[CompiledModule]) -> LocalStats {
+    let mut stats = LocalStats::default();
+    stats.modules = modules.len();
+
+    for m in modules {
+        // Count structs
+        for def in m.struct_defs() {
+            stats.structs += 1;
+            let handle = m.datatype_handle_at(def.struct_handle);
+            if handle.abilities.has_key() {
+                stats.key_structs += 1;
+            }
+        }
+
+        // Count functions with detailed breakdown
+        for def in m.function_defs() {
+            stats.functions_total += 1;
+
+            // Check if native
+            if def.code.is_none() {
+                stats.functions_native += 1;
+            }
+
+            // Check visibility
+            match def.visibility {
+                Visibility::Public => {
+                    stats.functions_public += 1;
+                    if def.is_entry {
+                        stats.entry_functions += 1;
+                        stats.public_entry_functions += 1;
+                    }
+                }
+                Visibility::Friend => {
+                    stats.functions_friend += 1;
+                    if def.is_entry {
+                        stats.entry_functions += 1;
+                        stats.friend_entry_functions += 1;
+                    }
+                }
+                Visibility::Private => {
+                    stats.functions_private += 1;
+                    if def.is_entry {
+                        stats.entry_functions += 1;
+                        stats.private_entry_functions += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    stats
+}
+
+/// Compute RPC statistics from the package inventory
+fn compute_rpc_stats(inv: &PackageInventory) -> RpcStats {
+    let mut stats = RpcStats::default();
+    stats.modules = inv.modules.len();
+
+    for module in inv.modules.values() {
+        stats.functions += module.functions.len();
+        stats.structs += module.structs.len();
+
+        // Count key structs (those with "key" ability)
+        for s in module.structs.values() {
+            if s.abilities.iter().any(|a| a.to_lowercase() == "key") {
+                stats.key_structs += 1;
+            }
+        }
+    }
+
+    stats
 }
 fn module_inventory_from_normalized_value(module: &Value) -> Result<ModuleInventory> {
     let mut functions = BTreeMap::new();
@@ -1209,6 +1354,180 @@ async fn verify_one_package_inventory(
     row
 }
 
+/// Verify one package and return detailed corpus report matching extractor1 schema
+async fn verify_one_package_corpus(
+    client: Arc<sui_sdk::SuiClient>,
+    package_id_str: &str,
+) -> CorpusReportRow {
+    let package_dir = sui_packages_artifact_dir_for_package_id(package_id_str)
+        .and_then(|p| p.canonicalize().map_err(|e| anyhow!(e)))
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+
+    let mut row = CorpusReportRow {
+        package_id: package_id_str.to_string(),
+        package_dir,
+        local: LocalStats::default(),
+        rpc: RpcStats::default(),
+        rpc_vs_local: ModuleCountComparison::default(),
+        interface_compare: InterfaceCompare::default(),
+        interface_compare_sample: None,
+        error: None,
+    };
+
+    // Load local compiled modules
+    let local_compiled =
+        match load_compiled_modules_with_rpc_deps(Arc::clone(&client), package_id_str).await {
+            Ok(v) => v,
+            Err(e) => {
+                row.error = Some(format!("local_compiled_modules_error: {e:#}"));
+                return row;
+            }
+        };
+
+    // Filter to just this package's modules (not dependencies)
+    let original_id = read_original_package_id_from_metadata(package_id_str)
+        .unwrap_or_else(|_| package_id_str.to_string());
+    let rpc_oid = match object_id_from_hex_str(package_id_str) {
+        Ok(v) => v,
+        Err(e) => {
+            row.error = Some(format!("invalid_object_id: {e:#}"));
+            return row;
+        }
+    };
+    let package_addr = {
+        let hex = original_id.strip_prefix("0x").unwrap_or(&original_id);
+        let padded = format!("{:0>64}", hex);
+        move_core_types::account_address::AccountAddress::from_hex_literal(&format!("0x{}", padded))
+            .unwrap_or_else(|_| move_core_types::account_address::AccountAddress::from(rpc_oid))
+    };
+    let local_compiled: Vec<CompiledModule> = local_compiled
+        .into_iter()
+        .filter(|m| *m.self_id().address() == package_addr)
+        .collect();
+
+    if local_compiled.is_empty() {
+        row.error = Some("local_package_modules_not_found".to_string());
+        return row;
+    }
+
+    // Compute local stats
+    row.local = compute_local_stats(&local_compiled);
+    let local_inv = package_inventory_from_compiled_modules(&local_compiled);
+
+    // Fetch RPC normalized modules
+    let rpc_modules = match client
+        .read_api()
+        .get_normalized_move_modules_by_package(rpc_oid)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            row.error = Some(format!("rpc_normalized_modules_error: {e:#}"));
+            return row;
+        }
+    };
+
+    let mut rpc_modules_value = match serde_json::to_value(&rpc_modules) {
+        Ok(v) => v,
+        Err(e) => {
+            row.error = Some(format!("rpc_serialize_error: {e:#}"));
+            return row;
+        }
+    };
+    canonicalize_json_value(&mut rpc_modules_value);
+
+    let rpc_inv = match package_inventory_from_normalized_modules(&rpc_modules_value) {
+        Ok(v) => v,
+        Err(e) => {
+            row.error = Some(format!("rpc_inventory_parse_error: {e:#}"));
+            return row;
+        }
+    };
+
+    // Compute RPC stats
+    row.rpc = compute_rpc_stats(&rpc_inv);
+
+    // Compute rpc_vs_local module comparison
+    row.rpc_vs_local.left_count = rpc_inv.modules.len();
+    row.rpc_vs_local.right_count = local_inv.modules.len();
+    for m in rpc_inv.modules.keys() {
+        if !local_inv.modules.contains_key(m) {
+            row.rpc_vs_local.missing_in_right.push(m.clone());
+        }
+    }
+    for m in local_inv.modules.keys() {
+        if !rpc_inv.modules.contains_key(m) {
+            row.rpc_vs_local.extra_in_right.push(m.clone());
+        }
+    }
+
+    // Compute interface comparison
+    let mut modules_compared = 0usize;
+    let mut structs_compared = 0usize;
+    let mut struct_mismatches = 0usize;
+    let mut functions_compared = 0usize;
+    let mut function_mismatches = 0usize;
+
+    for (mname, rpc_m) in &rpc_inv.modules {
+        if let Some(local_m) = local_inv.modules.get(mname) {
+            modules_compared += 1;
+
+            // Compare functions
+            for (fname, rpc_f) in &rpc_m.functions {
+                if let Some(local_f) = local_m.functions.get(fname) {
+                    functions_compared += 1;
+                    if rpc_f != local_f {
+                        function_mismatches += 1;
+                    }
+                }
+            }
+
+            // Compare structs
+            for (sname, rpc_s) in &rpc_m.structs {
+                if let Some(local_s) = local_m.structs.get(sname) {
+                    structs_compared += 1;
+                    if rpc_s != local_s {
+                        struct_mismatches += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    row.interface_compare = InterfaceCompare {
+        modules_compared,
+        modules_missing_in_bytecode: row.rpc_vs_local.missing_in_right.len(),
+        modules_extra_in_bytecode: row.rpc_vs_local.extra_in_right.len(),
+        structs_compared,
+        struct_mismatches,
+        functions_compared,
+        function_mismatches,
+        mismatches_total: struct_mismatches + function_mismatches,
+    };
+
+    row
+}
+
+/// Corpus summary statistics matching extractor1 schema
+#[derive(Debug, Serialize)]
+struct CorpusSummary {
+    total: usize,
+    local_ok: usize,
+    rpc_enabled: bool,
+    rpc_ok: usize,
+    rpc_module_match: usize,
+    rpc_exposed_function_count_match: usize,
+    interface_compare_enabled: bool,
+    interface_ok: usize,
+    interface_mismatch_packages: usize,
+    interface_mismatches_total: usize,
+    problems: usize,
+    report_jsonl: String,
+    index_jsonl: String,
+    problems_jsonl: String,
+}
+
 async fn run_verify_inventory(
     args: &Args,
     client: Arc<sui_sdk::SuiClient>,
@@ -1251,6 +1570,125 @@ async fn run_verify_inventory(
     Ok(out_path)
 }
 
+/// Run corpus verification and output detailed results matching extractor1 schema
+async fn run_corpus_verification(
+    args: &Args,
+    client: Arc<sui_sdk::SuiClient>,
+    summary_jsonl_path: &Path,
+    out_dir: &Path,
+) -> Result<()> {
+    let ids = read_package_ids_from_summary_jsonl(summary_jsonl_path)?;
+    if ids.is_empty() {
+        return Err(anyhow!(
+            "no package ids found in summary jsonl: {}",
+            summary_jsonl_path.display()
+        ));
+    }
+
+    let sample_size = args
+        .verify_inventory_sample_size
+        .unwrap_or(ids.len())
+        .min(ids.len());
+    let selected = &ids[..sample_size];
+
+    // Create output directory
+    fs::create_dir_all(out_dir)?;
+
+    let report_path = out_dir.join("corpus_report.jsonl");
+    let index_path = out_dir.join("index.jsonl");
+    let problems_path = out_dir.join("problems.jsonl");
+    let summary_path = out_dir.join("corpus_summary.json");
+
+    let report_file = fs::File::create(&report_path)?;
+    let mut report_out = std::io::BufWriter::new(report_file);
+
+    let index_file = fs::File::create(&index_path)?;
+    let mut index_out = std::io::BufWriter::new(index_file);
+
+    let problems_file = fs::File::create(&problems_path)?;
+    let mut problems_out = std::io::BufWriter::new(problems_file);
+
+    // Aggregate stats
+    let mut total = 0usize;
+    let mut local_ok = 0usize;
+    let mut rpc_ok = 0usize;
+    let mut rpc_module_match = 0usize;
+    let mut interface_ok = 0usize;
+    let mut interface_mismatch_packages = 0usize;
+    let mut interface_mismatches_total = 0usize;
+    let mut problems = 0usize;
+
+    for package_id in selected {
+        total += 1;
+        let row = verify_one_package_corpus(Arc::clone(&client), package_id).await;
+
+        // Write to report
+        serde_json::to_writer(&mut report_out, &row)?;
+        report_out.write_all(b"\n")?;
+
+        // Write to index
+        serde_json::to_writer(&mut index_out, &json!({"package_id": package_id}))?;
+        index_out.write_all(b"\n")?;
+
+        // Update stats
+        if row.error.is_none() {
+            local_ok += 1;
+            rpc_ok += 1;
+
+            if row.rpc_vs_local.missing_in_right.is_empty()
+                && row.rpc_vs_local.extra_in_right.is_empty()
+            {
+                rpc_module_match += 1;
+            }
+
+            if row.interface_compare.mismatches_total == 0 {
+                interface_ok += 1;
+            } else {
+                interface_mismatch_packages += 1;
+                interface_mismatches_total += row.interface_compare.mismatches_total;
+            }
+        } else {
+            problems += 1;
+            serde_json::to_writer(&mut problems_out, &row)?;
+            problems_out.write_all(b"\n")?;
+        }
+    }
+
+    report_out.flush()?;
+    index_out.flush()?;
+    problems_out.flush()?;
+
+    // Write summary
+    let summary = CorpusSummary {
+        total,
+        local_ok,
+        rpc_enabled: true,
+        rpc_ok,
+        rpc_module_match,
+        rpc_exposed_function_count_match: rpc_module_match, // Same as module match for now
+        interface_compare_enabled: true,
+        interface_ok,
+        interface_mismatch_packages,
+        interface_mismatches_total,
+        problems,
+        report_jsonl: report_path.display().to_string(),
+        index_jsonl: index_path.display().to_string(),
+        problems_jsonl: problems_path.display().to_string(),
+    };
+
+    let summary_file = fs::File::create(&summary_path)?;
+    serde_json::to_writer_pretty(summary_file, &summary)?;
+
+    println!("corpus report -> {}", report_path.display());
+    println!("corpus summary -> {}", summary_path.display());
+    println!(
+        "Results: {}/{} passed, {} problems",
+        interface_ok, total, problems
+    );
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -1262,7 +1700,16 @@ async fn main() -> Result<()> {
             .context("build sui client")?,
     );
 
-    // Handle verify-inventory mode
+    // Handle corpus output mode (detailed stats matching extractor1)
+    if let (Some(ref summary_path), Some(ref out_dir)) = (
+        &args.verify_inventory_from_summary_jsonl,
+        &args.corpus_out_dir,
+    ) {
+        run_corpus_verification(&args, Arc::clone(&client), summary_path, out_dir).await?;
+        return Ok(());
+    }
+
+    // Handle verify-inventory mode (legacy simple output)
     if let Some(ref summary_path) = args.verify_inventory_from_summary_jsonl {
         let out_path = run_verify_inventory(&args, Arc::clone(&client), summary_path).await?;
         println!("inventory verified -> {}", out_path.display());
